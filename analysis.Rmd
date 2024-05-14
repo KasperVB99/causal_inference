@@ -1,0 +1,244 @@
+---
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+```{r}
+R.utils::sourceDirectory("./functions", modifiedOnly = FALSE)
+library(magrittr)
+
+raw_data = get_data("raw_data")
+```
+
+```{r}
+engineered_data = raw_data %>% 
+  dplyr::arrange(match_id, minute) %>% 
+  dplyr::mutate(goal_minute = dplyr::if_else(result == "Goal", minute, NA)) %>% 
+  dplyr::group_by(match_id) %>% 
+  dplyr::filter(any(result == "Goal")) %>% 
+  dplyr::mutate(first_goal = min(goal_minute, na.rm = TRUE),
+                first_goal_scorer = dplyr::first(h_a[minute == first_goal & result == "Goal"]),
+                before_first_goal = dplyr::case_when(minute < first_goal ~ "before",
+                                                     minute > first_goal ~ "after",
+                                                     minute == first_goal ~ "goal"),
+                scorer_team = dplyr::case_when(h_a == "a" & first_goal_scorer == "a" ~ "Scorer",
+                                               h_a == "a" & first_goal_scorer == "h" ~ "Conceder",
+                                               h_a == "h" & first_goal_scorer == "h" ~ "Scorer",
+                                               h_a == "h" & first_goal_scorer == "a" ~ "Conceder"),
+                scorer_prob = dplyr::case_when(first_goal_scorer == "a" ~ away_prob,
+                                               first_goal_scorer == "h" ~ home_prob),
+                conceder_prob = dplyr::case_when(first_goal_scorer == "a" ~ home_prob,
+                                                 first_goal_scorer == "h" ~ away_prob)) %>% 
+  dplyr::group_by(match_id, scorer_team, before_first_goal) %>% 
+  dplyr::mutate(xG = sum(as.numeric(xG))) %>% 
+  tidyr::pivot_wider(names_from = c(before_first_goal, scorer_team), values_from = xG) %>% 
+  dplyr::select(Date, match_id, scorer_prob, draw_prob, conceder_prob, first_goal, first_goal_scorer,
+                before_Scorer, after_Scorer, before_Conceder, after_Conceder) %>% 
+  dplyr::group_by(match_id) %>% 
+  dplyr::mutate(before_Scorer = mean(before_Scorer, na.rm = TRUE),
+                after_Scorer = mean(after_Scorer, na.rm = TRUE),
+                before_Conceder = mean(before_Conceder, na.rm = TRUE),
+                after_Conceder = mean(after_Conceder, na.rm = TRUE)) %>% 
+  dplyr::ungroup() %>% 
+  dplyr::distinct(Date, match_id, .keep_all = TRUE) %>% 
+  tidyr::replace_na(list(before_Scorer = 0,
+                         after_Scorer = 0,
+                         before_Conceder = 0,
+                         after_Conceder = 0))
+
+```
+
+```{r}
+pr_minute_data = engineered_data %>% 
+  dplyr::mutate(
+    first_goal = as.numeric(first_goal),
+    before_Scorer = before_Scorer / (first_goal - 1),
+    before_Conceder = before_Conceder / (first_goal - 1),
+    after_Scorer = after_Scorer / (90 - first_goal),
+    after_Conceder = after_Conceder / (90 - first_goal)
+  )
+
+final_data = pr_minute_data %>% 
+  dplyr::select(-Date, -match_id) %>% 
+  tidyr::pivot_longer(
+    c(before_Scorer, before_Conceder),
+    names_to = "before",
+    values_to = "xG_before") %>% 
+  dplyr::mutate(
+    xG_after = dplyr::if_else(before == "before_Scorer", after_Scorer, after_Conceder),
+    first_scorer = as.factor(dplyr::if_else(before == "before_Scorer", 1, 0)),
+    h_a = dplyr::case_when(first_scorer == 1 & first_goal_scorer == "a" ~ "a",
+                           first_scorer == 1 & first_goal_scorer == "h" ~ "h",
+                           first_scorer == 0 & first_goal_scorer == "h" ~ "a",
+                           first_scorer == 0 & first_goal_scorer == "a" ~ "h"),
+    win_prob = dplyr::case_when(first_scorer == 1 ~ scorer_prob,
+                                first_scorer == 0 ~ conceder_prob)
+  ) %>% 
+  dplyr::select(xG_after, first_scorer, win_prob, h_a, xG_before, first_goal) %>% 
+  dplyr::distinct() %>% 
+  tidyr::drop_na() %>% 
+  dplyr::filter(xG_after != Inf,
+                xG_before != Inf)
+  
+
+subgroups = final_data %>% 
+  dplyr::mutate(group = dplyr::ntile(win_prob, 3)) %>% 
+  dplyr::group_split(group) %>% 
+  purrr::map(
+    .f = ~ lm(data = ., xG_after ~ first_scorer)
+  ) %>% 
+  stargazer::stargazer(type = "text",
+                     intercept.bottom = FALSE,
+                     digits = 4,
+                     omit.stat = c("adj.rsq", "f", "ser"),
+                     ci = TRUE,
+                     ci.level = 0.95)
+
+
+reg3 = lm(xG_after ~ first_scorer + win_prob + h_a + xG_before + first_goal,
+         data = final_data)
+
+
+reg1 = lm(xG_after ~ first_scorer,
+         data = final_data)
+
+reg2 = lm(xG_after ~ first_scorer + win_prob,
+         data = final_data)
+
+
+stargazer::stargazer(reg1, reg2, reg3, 
+                     type = "latex",
+                     covariate.labels=c(
+                       "Intercept", "Første målscorer dummy",
+                       "P(sejr)","Hjemmehold dummy",
+                       "xG pre", "Første mål min"),
+                     intercept.bottom = FALSE,
+                     digits = 4,
+                     omit.stat = c("adj.rsq", "f", "ser"),
+                     ci = F,
+                     report=('vc*p'))
+
+epsilon_reg = lm(xG_after ~ win_prob + h_a + xG_before + first_goal,
+         data = final_data)
+
+epsilon = lm(epsilon_reg$residuals ~ final_data$first_scorer)
+summary(epsilon)
+
+dplyr::bind_cols(epsilon_reg$residuals, final_data$first_scorer) %>% 
+  dplyr::rename(epsilon = ...1, first_scorer = ...2) %>% 
+  dplyr::group_by(first_scorer) %>% 
+  dplyr::summarise(epsilon = mean(epsilon)) %>% 
+  ggplot2::ggplot(ggplot2::aes(x = first_scorer, y = epsilon, fill = first_scorer)) + 
+  ggplot2::geom_bar(stat="identity") +
+  ggplot2::xlab("First scorer dummy (Treatment effect)") + 
+  ggplot2::ylab("Expected goals/min after first goal") + 
+  ggthemes::theme_clean() + 
+  ggplot2::theme(legend.position = "none")
+
+final_data %>% 
+  dplyr::filter(xG_after == Inf)
+
+mean(final_data$xG_after)
+
+
+raw_data %>% 
+  dplyr::distinct(match_id)
+
+final_data %>% 
+  dplyr::mutate(favorite_group = dplyr::ntile(win_prob, 3)) %>% 
+  dplyr::group_by(first_scorer) %>% 
+  dplyr::summarise(xG_after = mean(xG_after)) %>% 
+  ggplot2::ggplot(ggplot2::aes(x = first_scorer, y = xG_after, fill = first_scorer)) + 
+    ggplot2::geom_bar(stat="identity") +
+  ggplot2::xlab("Treatment (scorer første mål)") + 
+  ggplot2::ylab("Forventede antal mål/minut efter første scoring") + 
+  ggthemes::theme_few() + 
+  ggplot2::theme(legend.position = "none")
+
+```
+
+
+```{r}
+hej = engineered_data %>% 
+  tidyr::pivot_longer(
+    c(before_Scorer, before_Conceder), 
+    names_to = "xG_before",
+    alues_to = "value")
+
+
+reg = lm(pr_minute_data$before_Scorer)
+
+load("/Users/kaspe/AppData/Local/Temp/MicrosoftEdgeDownloads/d0c8599d-19f4-4f2f-b809-39db02113167/deaths.Rdata")
+state<-readxl::read_excel("states.xlsx")
+state$FIPS <- as.factor(state$FIPS)
+names(state)
+deaths <- merge(deaths,state,by.x = "state", by.y = "FIPS",x.all = TRUE)
+
+AP_data_1 <- deaths %>% 
+  dplyr::filter(Cstate %in% c("CT","AR")) %>%
+  dplyr::filter(year <= 1983, agegr == "18-20 yrs", dtype == "MVA") %>%
+  dplyr::arrange(Cstate,year)
+
+AP_data_1 <- AP_data_1 %>%
+  dplyr::mutate(treat = (Cstate == "CT"),
+                post = (year >= 1973))
+
+diff_in_diff = final_data %>% 
+  tidyr::pivot_longer(
+    c(xG_after, xG_before),
+    names_to = "post",
+    values_to = "xG"
+  ) %>% 
+  dplyr::mutate(
+    post = dplyr::if_else(post == "xG_after", TRUE, FALSE),
+    treatment = dplyr::if_else(first_scorer == 1, TRUE, FALSE)
+  )
+
+diff_in_diff_2045 = diff_in_diff %>% 
+  dplyr::filter(
+    first_goal < 100,
+    first_goal >= 60
+  )
+
+diff_in_diff_reg <- lm(xG~treatment + post + treatment * post, 
+          data = diff_in_diff)
+
+diff_in_diff_2045_reg <- lm(xG~treatment + post + treatment * post, 
+          data = diff_in_diff_2045)
+
+diff_in_diff_2045_reg_exo <- lm(xG~treatment + post + treatment * post +
+                                  win_prob, 
+          data = diff_in_diff_2045)
+
+stargazer::stargazer(diff_in_diff_reg, diff_in_diff_2045_reg, diff_in_diff_2045_reg_exo, 
+                     column.labels = c("Full dataset", "Goal min 20-45", "Goal min 20-45"),
+                     type = "text",
+                     covariate.labels=c(
+                       "Intercept", "Treatment",
+                       "Post", "P(Sejr)",
+                       "Treatment * Post"
+                       ),
+                     intercept.bottom = FALSE,
+                     digits = 4,
+                     omit.stat = c("adj.rsq", "f", "ser"),
+                     ci = F,
+                     report=('vc*p'))
+
+summary(diff_in_diff_reg)
+
+diff_in_diff %>% 
+  dplyr::group_by(post, treatment) %>% 
+  dplyr::summarise(
+    mean_xG = mean(xG)
+  ) %>% 
+  dplyr::mutate(post = forcats::as_factor(dplyr::if_else(post == TRUE, "Efter", "Før"))) %>% 
+  ggplot2::ggplot(ggplot2::aes(x = post, y = mean_xG, col = treatment)) + 
+  ggplot2::geom_point(size = 4) +
+  ggplot2::xlab("Før eller efter første mål") + 
+  ggplot2::ylab("Forventede mål/minut") + 
+  ggthemes::theme_clean() + 
+  ggplot2::labs(colour="Treated") + 
+  ggplot2::geom_line(ggplot2::aes(x = post, y = mean_xG, group = treatment), size = 1.25)
+
+```
+
